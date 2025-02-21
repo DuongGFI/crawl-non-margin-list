@@ -1,5 +1,6 @@
 # main.py
 import os
+import uvicorn
 from datetime import datetime
 from typing import List
 
@@ -172,10 +173,5 @@ async def get_stocks(request: Request):
         raise HTTPException(500, detail=f"Crawling failed: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        timeout_keep_alive=120
-    )
+    port = int(os.environ.get("PORT", 10000))  # Thay đổi về 10000
+    uvicorn.run(app, host="0.0.0.0", port=port)
