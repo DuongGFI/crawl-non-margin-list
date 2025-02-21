@@ -3,6 +3,7 @@ import os
 import uvicorn
 from datetime import datetime
 from typing import List
+import logging
 
 import httpx
 from bs4 import BeautifulSoup
@@ -170,7 +171,8 @@ async def get_stocks(request: Request):
             }
         }
     except Exception as e:
-        raise HTTPException(500, detail=f"Crawling failed: {str(e)}")
+        logging.exception("An error occurred while crawling stocks")
+        raise HTTPException(status_code=500, detail=f"Crawling failed: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # Thay đổi về 10000
