@@ -1,24 +1,25 @@
-# main.py
 import os
 import uvicorn
+import logging
 from datetime import datetime
 from typing import List
-import logging
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-from playwright.async_api import async_playwright, Browser
+from playwright.async_api import async_playwright, Browser, Playwright
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Cấu hình
 class Settings:
     HSX_URL = "https://www.hsx.vn/Modules/Listed/Web/NonMarginList"
     HNX_URL = "https://hnx.vn/vi-vn/co-phieu-etfs/chung-khoan-ny-khong-ky-quy.html"
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    )
     TIMEOUT = 20.0
     MAX_PAGES = 50
 
@@ -70,7 +71,7 @@ class HSXCrawler:
             "sidx": "id",
             "sord": "desc"
         }
-        
+
         async with httpx.AsyncClient(timeout=settings.TIMEOUT) as client:
             response = await client.get(
                 settings.HSX_URL,
@@ -96,11 +97,14 @@ class HSXCrawler:
 # HNX Crawler
 class HNXCrawler:
     _browser: Browser = None
+    _playwright: Playwright = None
 
     @classmethod
     async def get_browser(cls) -> Browser:
         if not cls._browser or not cls._browser.is_connected():
-            cls._browser = await async_playwright().start().chromium.launch(
+            # Khởi tạo phiên bản Playwright trước
+            cls._playwright = await async_playwright().start()
+            cls._browser = await cls._playwright.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
@@ -118,7 +122,7 @@ class HNXCrawler:
                 exchange="HNX"
             )
             for row in soup.select("table#_tableDatas tbody tr")
-            if len(cols := row.find_all("td")) >= 5
+            if (cols := row.find_all("td")) and len(cols) >= 5
         ]
 
     @classmethod
@@ -126,21 +130,32 @@ class HNXCrawler:
     async def crawl(cls) -> List[StockItem]:
         browser = await cls.get_browser()
         context = await browser.new_context()
-        
+
         try:
             page = await context.new_page()
             await page.goto(settings.HNX_URL, wait_until="networkidle")
-            
+
             items = []
+            # Hạn chế số lần lặp nếu cần
             for _ in range(settings.MAX_PAGES):
-                items += cls.parse_html(await page.content())
-                
-                if await page.locator("#next").is_disabled():
+                content = await page.content()
+                items += cls.parse_html(content)
+
+                # Lấy container chứa phân trang và tìm phần tử "next" bên trong nó.
+                container = page.locator("div#d_page div#d_number_of_page")
+                next_button = container.locator("li:has(span#next) span#next")
+
+                # Kiểm tra xem phần tử next có tồn tại không
+                if await next_button.count() == 0:
                     break
-                
-                await page.click("#next")
+
+                # Nếu nút next đang ở trạng thái disable thì thoát vòng lặp
+                if await next_button.is_disabled():
+                    break
+
+                await next_button.click()
                 await page.wait_for_load_state("domcontentloaded")
-            
+
             return items
         finally:
             await context.close()
@@ -175,5 +190,5 @@ async def get_stocks(request: Request):
         raise HTTPException(status_code=500, detail=f"Crawling failed: {str(e)}")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Thay đổi về 10000
+    port = int(os.environ.get("PORT", 10000))  # Thay đổi về 10000 nếu PORT không được set
     uvicorn.run(app, host="0.0.0.0", port=port)
