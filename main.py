@@ -1,184 +1,181 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-import pandas as pd
-import requests
+# main.py
+import os
+from datetime import datetime
+from typing import List
+
+import httpx
 from bs4 import BeautifulSoup
-import time
-from playwright.async_api import async_playwright
-import logging
-import sys
-import asyncio
-import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
+from playwright.async_api import async_playwright, Browser
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-if sys.platform.startswith("win"):
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# Cấu hình
+class Settings:
+    HSX_URL = "https://www.hsx.vn/Modules/Listed/Web/NonMarginList"
+    HNX_URL = "https://hnx.vn/vi-vn/co-phieu-etfs/chung-khoan-ny-khong-ky-quy.html"
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    TIMEOUT = 20.0
+    MAX_PAGES = 50
 
-app = FastAPI()
-logging.basicConfig(level=logging.INFO)
+settings = Settings()
 
+app = FastAPI(
+    title="Stock Crawler API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None
+)
 
-# --- HSX: Các hàm crawl dữ liệu (không thay đổi) ---
-def remove_nested_spans(html_content: str) -> str:
-    """Loại bỏ các thẻ span lồng nhau và chỉ giữ lại text."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for span in soup.find_all('span'):
-        span.replace_with(span.get_text())
-    return soup.get_text()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
-def get_hsx_list(page: int) -> pd.DataFrame:
-    """Lấy dữ liệu từ HSX cho một trang cụ thể."""
-    timestamp = int(time.time())
-    url = f"https://www.hsx.vn/Modules/Listed/Web/NonMarginList?_search=false&nd={timestamp}&rows=30&page={page}&sidx=id&sord=desc"
-    headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Cookie': 'ASP.NET_SessionId=cf5g3zcoqpcfjmxveflvfxye; ...',
-        'Host': 'www.hsx.vn',
-        'Referer': 'https://www.hsx.vn/Modules/Listed/Web/NonMarginTradeView?fid=48cf424f8f1e47c6b00de6080e9350d2',
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N)...',
-        'X-Requested-With': 'XMLHttpRequest'
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        logging.error(f"Lỗi khi request HSX: {e}")
-        raise HTTPException(status_code=500, detail=f"Lỗi khi request HSX: {e}")
+# Models
+class StockItem(BaseModel):
+    ticker: str
+    name: str
+    date: str
+    reason: str
+    exchange: str
 
-    rows = data.get('rows', [])
-    if not rows:
-        return pd.DataFrame()
+    @field_validator("date")
+    def validate_date(cls, value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return value
+        except ValueError:
+            raise ValueError("Invalid date format")
 
-    all_cells = [d.get('cell', []) for d in rows]
-    try:
-        df = pd.DataFrame(all_cells, columns=['id', 'ticker', 'code1', 'code2', 'name', 'date', 'reason'])
-    except Exception as e:
-        logging.error(f"Lỗi khi tạo DataFrame từ HSX: {e}")
-        raise HTTPException(status_code=500, detail=f"Lỗi khi tạo DataFrame từ HSX: {e}")
+class APIResponse(BaseModel):
+    data: List[StockItem]
+    metadata: dict
 
-    df['reason'] = df['reason'].apply(remove_nested_spans)
-    df['exchange'] = 'HOSE'
-    df['ticker'] = df['ticker'].str.strip()
-    df = df.drop(columns=['id', 'code1', 'code2'])
-    return df
-
-def get_hsx_list_all(max_pages: int = 100) -> pd.DataFrame:
-    """Lấy toàn bộ dữ liệu HSX qua nhiều trang."""
-    page = 1
-    data_frames = []
-    while page <= max_pages:
-        df = get_hsx_list(page)
-        if df.empty:
-            break
-        data_frames.append(df)
-        page += 1
-    return pd.concat(data_frames, ignore_index=True) if data_frames else pd.DataFrame()
-
-# --- HNX: Sử dụng async Playwright để crawl dữ liệu ---
-def crawl_current_page_from_html(html: str) -> pd.DataFrame:
-    """Crawl dữ liệu từ trang hiện tại của HNX từ nội dung HTML."""
-    soup = BeautifulSoup(html, 'html.parser')
-    table = soup.find('table', id='_tableDatas')
-    
-    data = []
-    if table:
-        tbody = table.find('tbody')
-        if tbody:
-            rows = tbody.find_all('tr')
-            for row in rows:
-                columns = row.find_all('td')
-                if len(columns) >= 5:
-                    ticker = columns[1].get_text(strip=True)
-                    name = columns[2].get_text(strip=True)
-                    date_str = columns[3].get_text(strip=True)
-                    reason = columns[4].get_text(strip=True).replace('- ', '').replace('-', '')
-                    data.append({
-                        'ticker': ticker,
-                        'name': name,
-                        'date': date_str,
-                        'reason': reason,
-                        'exchange': 'HNX'
-                    })
-    return pd.DataFrame(data)
-
-async def crawl_hnx_data(max_iterations: int = 50) -> pd.DataFrame:
-    """Crawl dữ liệu HNX với async Playwright."""
-    all_data = pd.DataFrame()
-    seen = set()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process',
-                '--disable-infobars'
-            ]
-        )
-        page = await browser.new_page()
-        await page.goto("https://hnx.vn/vi-vn/co-phieu-etfs/chung-khoan-ny-khong-ky-quy.html")
+# HSX Crawler
+class HSXCrawler:
+    @staticmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def fetch_page(page: int) -> List[dict]:
+        params = {
+            "_search": "false",
+            "rows": 30,
+            "page": page,
+            "sidx": "id",
+            "sord": "desc"
+        }
         
-        iteration = 0
-        while iteration < max_iterations:
-            iteration += 1
-            try:
-                await page.wait_for_selector("table#_tableDatas", timeout=10000)
-            except Exception:
-                logging.info("Không tìm thấy bảng dữ liệu, kết thúc crawl.")
-                break
-            html = await page.content()
-            df_new = crawl_current_page_from_html(html)
-            if df_new.empty:
-                logging.info("Không có dữ liệu mới trên trang, kết thúc crawl.")
-                break
-            new_rows = df_new[~df_new['ticker'].isin(seen)]
-            if new_rows.empty:
-                logging.info("Đã crawl hết dữ liệu trùng lặp, kết thúc crawl.")
-                break
-            seen.update(new_rows['ticker'].tolist())
-            all_data = pd.concat([all_data, new_rows], ignore_index=True)
-            try:
-                next_button = await page.query_selector("#next")
-                if not next_button:
-                    logging.info("Không tìm thấy nút next, kết thúc crawl.")
+        async with httpx.AsyncClient(timeout=settings.TIMEOUT) as client:
+            response = await client.get(
+                settings.HSX_URL,
+                params=params,
+                headers={"User-Agent": settings.USER_AGENT}
+            )
+            response.raise_for_status()
+            return response.json().get("rows", [])
+
+    @staticmethod
+    def process_data(rows: List[dict]) -> List[StockItem]:
+        return [
+            StockItem(
+                ticker=row["cell"][1].strip(),
+                name=row["cell"][4].strip(),
+                date=datetime.strptime(row["cell"][5], "%d/%m/%Y").strftime("%Y-%m-%d"),
+                reason=BeautifulSoup(row["cell"][6], "html.parser").get_text().strip(),
+                exchange="HOSE"
+            )
+            for row in rows if len(row.get("cell", [])) >= 7
+        ]
+
+# HNX Crawler
+class HNXCrawler:
+    _browser: Browser = None
+
+    @classmethod
+    async def get_browser(cls) -> Browser:
+        if not cls._browser or not cls._browser.is_connected():
+            cls._browser = await async_playwright().start().chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+        return cls._browser
+
+    @staticmethod
+    def parse_html(html: str) -> List[StockItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        return [
+            StockItem(
+                ticker=cols[1].get_text(strip=True),
+                name=cols[2].get_text(strip=True),
+                date=datetime.strptime(cols[3].get_text(strip=True), "%d/%m/%Y").strftime("%Y-%m-%d"),
+                reason=cols[4].get_text(strip=True).replace("- ", ""),
+                exchange="HNX"
+            )
+            for row in soup.select("table#_tableDatas tbody tr")
+            if len(cols := row.find_all("td")) >= 5
+        ]
+
+    @classmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def crawl(cls) -> List[StockItem]:
+        browser = await cls.get_browser()
+        context = await browser.new_context()
+        
+        try:
+            page = await context.new_page()
+            await page.goto(settings.HNX_URL, wait_until="networkidle")
+            
+            items = []
+            for _ in range(settings.MAX_PAGES):
+                items += cls.parse_html(await page.content())
+                
+                if await page.locator("#next").is_disabled():
                     break
-                await next_button.click()
-                await page.wait_for_selector("table#_tableDatas", timeout=10000)
-                await page.wait_for_timeout(500)  # đợi 0.5 giây
-            except Exception:
-                logging.info("Lỗi khi click nút next hoặc chờ dữ liệu, kết thúc crawl.")
-                break
-        
-        await browser.close()
-    return all_data
+                
+                await page.click("#next")
+                await page.wait_for_load_state("domcontentloaded")
+            
+            return items
+        finally:
+            await context.close()
 
-@app.get("/crawl")
-async def main_handler():
+# API Endpoints
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/stocks", response_model=APIResponse)
+async def get_stocks(request: Request):
     try:
-        # Crawl HSX (blocking, có thể chạy thêm vào thread nếu cần)
-        hsx_all = get_hsx_list_all()
-        
-        # Crawl HNX với async Playwright
-        hnx_all = await crawl_hnx_data()
-        
-        # Combine dữ liệu
-        combined_df = pd.concat([hsx_all, hnx_all], ignore_index=True)
-        
-        # Chuyển đổi định dạng ngày (nếu có giá trị không hợp lệ sẽ chuyển thành NaT)
-        dates_converted = pd.to_datetime(
-            combined_df['date'], 
-            format='%d/%m/%Y', 
-            errors='coerce'
-        )
-        combined_df['date'] = dates_converted.dt.strftime('%Y-%m-%d')
-        
-        result = combined_df.to_dict(orient='records')
-        return JSONResponse(content={"data": result})
-    
+        # HSX
+        hsx_data = []
+        for page in range(1, settings.MAX_PAGES + 1):
+            if not (rows := await HSXCrawler.fetch_page(page)):
+                break
+            hsx_data.extend(HSXCrawler.process_data(rows))
+
+        # HNX
+        hnx_data = await HNXCrawler.crawl()
+
+        return {
+            "data": hsx_data + hnx_data,
+            "metadata": {
+                "total": len(hsx_data) + len(hnx_data),
+                "generated_at": datetime.utcnow().isoformat()
+            }
+        }
     except Exception as e:
-        logging.error(f"Lỗi trong main_handler: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, detail=f"Crawling failed: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        timeout_keep_alive=120
+    )
