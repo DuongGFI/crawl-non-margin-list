@@ -133,7 +133,7 @@ class HNXCrawler:
 
         try:
             page = await context.new_page()
-            await page.goto(settings.HNX_URL, wait_until="networkidle")
+            await page.goto(settings.HNX_URL, wait_until="domcontentloaded", timeout=60000)
 
             items = []
             # Hạn chế số lần lặp nếu cần
