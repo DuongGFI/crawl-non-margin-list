@@ -3,7 +3,7 @@ import uvicorn
 import logging
 from datetime import datetime
 from typing import List
-
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
@@ -94,7 +94,71 @@ class HSXCrawler:
             for row in rows if len(row.get("cell", [])) >= 7
         ]
 
-# HNX Crawler
+# # HNX Crawler
+# class HNXCrawler:
+#     _browser: Browser = None
+#     _playwright: Playwright = None
+
+#     @classmethod
+#     async def get_browser(cls) -> Browser:
+#         if not cls._browser or not cls._browser.is_connected():
+#             # Khởi tạo phiên bản Playwright trước
+#             cls._playwright = await async_playwright().start()
+#             cls._browser = await cls._playwright.chromium.launch(
+#                 headless=True,
+#                 args=["--no-sandbox", "--disable-dev-shm-usage"]
+#             )
+#         return cls._browser
+
+#     @staticmethod
+#     def parse_html(html: str) -> List[StockItem]:
+#         soup = BeautifulSoup(html, "html.parser")
+#         return [
+#             StockItem(
+#                 ticker=cols[1].get_text(strip=True),
+#                 name=cols[2].get_text(strip=True),
+#                 date=datetime.strptime(cols[3].get_text(strip=True), "%d/%m/%Y").strftime("%Y-%m-%d"),
+#                 reason=cols[4].get_text(strip=True).replace("- ", ""),
+#                 exchange="HNX"
+#             )
+#             for row in soup.select("table#_tableDatas tbody tr")
+#             if (cols := row.find_all("td")) and len(cols) >= 5
+#         ]
+
+#     @classmethod
+#     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+#     async def crawl(cls) -> List[StockItem]:
+#         browser = await cls.get_browser()
+#         context = await browser.new_context()
+
+#         try:
+#             page = await context.new_page()
+#             await page.goto(settings.HNX_URL, wait_until="domcontentloaded", timeout=60000)
+
+#             items = []
+#             # Hạn chế số lần lặp nếu cần
+#             for _ in range(settings.MAX_PAGES):
+#                 content = await page.content()
+#                 items += cls.parse_html(content)
+
+#                 # Lấy container chứa phân trang và tìm phần tử "next" bên trong nó.
+#                 container = page.locator("div#d_page div#d_number_of_page")
+#                 next_button = container.locator("li:has(span#next) span#next")
+
+#                 # Kiểm tra xem phần tử next có tồn tại không
+#                 if await next_button.count() == 0:
+#                     break
+
+#                 # Nếu nút next đang ở trạng thái disable thì thoát vòng lặp
+#                 if await next_button.is_disabled():
+#                     break
+
+#                 await next_button.click()
+#                 await page.wait_for_load_state("domcontentloaded")
+
+#             return items
+#         finally:
+#             await context.close()
 class HNXCrawler:
     _browser: Browser = None
     _playwright: Playwright = None
@@ -102,7 +166,6 @@ class HNXCrawler:
     @classmethod
     async def get_browser(cls) -> Browser:
         if not cls._browser or not cls._browser.is_connected():
-            # Khởi tạo phiên bản Playwright trước
             cls._playwright = await async_playwright().start()
             cls._browser = await cls._playwright.chromium.launch(
                 headless=True,
@@ -111,7 +174,7 @@ class HNXCrawler:
         return cls._browser
 
     @staticmethod
-    def parse_html(html: str) -> List[StockItem]:
+    def parse_html(html: str) -> List["StockItem"]:
         soup = BeautifulSoup(html, "html.parser")
         return [
             StockItem(
@@ -127,7 +190,7 @@ class HNXCrawler:
 
     @classmethod
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def crawl(cls) -> List[StockItem]:
+    async def crawl(cls) -> List["StockItem"]:
         browser = await cls.get_browser()
         context = await browser.new_context()
 
@@ -136,31 +199,68 @@ class HNXCrawler:
             await page.goto(settings.HNX_URL, wait_until="domcontentloaded", timeout=60000)
 
             items = []
-            # Hạn chế số lần lặp nếu cần
+            # Lặp qua các trang với số lần tối đa từ settings.MAX_PAGES
             for _ in range(settings.MAX_PAGES):
-                content = await page.content()
-                items += cls.parse_html(content)
 
-                # Lấy container chứa phân trang và tìm phần tử "next" bên trong nó.
-                container = page.locator("div#d_page div#d_number_of_page")
-                next_button = container.locator("li:has(span#next) span#next")
-
-                # Kiểm tra xem phần tử next có tồn tại không
-                if await next_button.count() == 0:
+                try:
+                    await page.wait_for_selector("table#_tableDatas", timeout=10000)
+                except Exception:
+                    logging.info("Không tìm thấy bảng dữ liệu, kết thúc crawl.")
                     break
 
-                # Nếu nút next đang ở trạng thái disable thì thoát vòng lặp
+                content = await page.content()
+                new_items = cls.parse_html(content)
+
+                # Nếu dữ liệu trống, thử đợi thêm 1 giây rồi lấy lại nội dung trang
+                if not new_items:
+                    logging.warning("Trang hiện tại không có dữ liệu. Đợi thêm và thử lại.")
+                    await asyncio.sleep(1)
+                    content = await page.content()
+                    new_items = cls.parse_html(content)
+                    if not new_items:
+                        logging.info("Không có dữ liệu sau khi đợi, kết thúc crawl.")
+                        break
+
+                items.extend(new_items)
+
+                container = page.locator("div#d_page div#d_number_of_page")
+                next_button = container.locator("li:has(span#next) span#next")
+                # Nếu không có nút next hoặc nút bị disable thì dừng crawl
+                if await next_button.count() == 0:
+                    logging.info("Không tìm thấy nút next, kết thúc crawl.")
+                    break
                 if await next_button.is_disabled():
+                    logging.info("Nút next bị vô hiệu hóa, kết thúc crawl.")
+                    break
+
+                # Lưu nội dung hiện tại của bảng để so sánh sau khi click next
+                try:
+                    previous_table_html = await page.inner_html("table#_tableDatas")
+                except Exception as e:
+                    logging.info(f"Lỗi khi lấy nội dung bảng: {e}")
                     break
 
                 await next_button.click()
-                await page.wait_for_load_state("domcontentloaded")
+                try:
+                    await page.wait_for_function(
+                        f"document.querySelector('table#_tableDatas').innerHTML !== `{previous_table_html}`",
+                        timeout=10000
+                    )
+                except Exception as e:
+                    logging.info(f"Lỗi khi chờ thay đổi bảng dữ liệu: {e}. Kết thúc crawl.")
+                    break
+
+                await page.wait_for_timeout(500)  # Đợi thêm 0.5 giây nếu cần
 
             return items
         finally:
             await context.close()
 
 # API Endpoints
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Stock Crawler API"}
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
